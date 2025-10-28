@@ -1,0 +1,5 @@
+{
+  "name": "PDF Alt Text Generator",
+  "description": "An application to identify images, tables, and equations from a PDF file and generate alternative text for each element using Gemini. The results can be downloaded as a spreadsheet.",
+  "requestFramePermissions": []
+}
