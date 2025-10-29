@@ -6,9 +6,9 @@ import { Loader } from './components/Loader';
 import { Footer } from './components/Footer';
 import { processPdfToImages } from './services/pdfProcessor';
 import { processDocxToImages } from './services/docxProcessor';
-import { generateImageAnalysis, generatePageAnalysis, generateSummary, explainError } from './services/geminiService';
+import { generatePageAnalysis, generateSnippetAnalysis, generateSummary, explainError } from './services/geminiService';
 import { fetchImageAsBase64 } from './services/urlProcessor';
-import { ProcessedItem, ProcessingState, User, IdentifiedItem } from './types';
+import { ProcessedItem, ProcessingState, User, IdentifiedItem, IdentifiedItemType } from './types';
 import { useToast, useAuth } from './hooks/useToast';
 
 const cropImage = (
@@ -19,14 +19,17 @@ const cropImage = (
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      const buffer = 5; // Add a small buffer to prevent cutting off edges
+      const buffer = 5;
       const sx = Math.max(0, box.x - buffer);
       const sy = Math.max(0, box.y - buffer);
       const sWidth = Math.min(img.width - sx, box.width + buffer * 2);
       const sHeight = Math.min(img.height - sy, box.height + buffer * 2);
 
-      if (sWidth <= 0 || sHeight <= 0) return reject(new Error("Invalid crop dimensions"));
-
+      if (sWidth <= 0 || sHeight <= 0) {
+        console.error("Invalid crop dimensions:", { box, imgWidth: img.width, imgHeight: img.height });
+        return reject(new Error("Invalid crop dimensions"));
+      }
+      
       canvas.width = sWidth;
       canvas.height = sHeight;
       const ctx = canvas.getContext('2d');
@@ -38,7 +41,6 @@ const cropImage = (
     img.src = imageBase64;
   });
 }
-
 
 // --- LOGIN PAGE ---
 const LoginPage: React.FC = () => {
@@ -154,16 +156,30 @@ const AltTextGeneratorTool: React.FC = () => {
     }
     setResults(prev => prev.map(r => r.id === itemId ? {...r, isRegenerating: true} : r));
     try {
-        const imageToAnalyze = itemToRegen.originalPageImage && itemToRegen.boundingBox
-            ? await cropImage(itemToRegen.originalPageImage, itemToRegen.boundingBox)
-            : itemToRegen.previewImage;
-        const analysis = await generateImageAnalysis(imageToAnalyze);
-        decrementTokens(TOKENS_PER_JOB);
-        setResults(prev => prev.map(r => r.id === itemId ? {
-            ...r, ...analysis, isRegenerating: false, tokensSpent: r.tokensSpent + TOKENS_PER_JOB, isEditing: false, originalState: undefined
-        } : r));
-        addToast('Analysis regenerated!', 'success');
-        if(user.tokens - TOKENS_PER_JOB < 50) addToast('Your token balance is getting low.', 'info');
+        const analysisList = await generatePageAnalysis(itemToRegen.originalPageImage || itemToRegen.previewImage);
+        
+        if (analysisList.length > 0) {
+            decrementTokens(TOKENS_PER_JOB);
+             const analysis = analysisList[0];
+            const assetPreview = analysis.boundingBox
+                ? await cropImage(itemToRegen.originalPageImage || itemToRegen.previewImage, analysis.boundingBox)
+                : itemToRegen.previewImage;
+
+            setResults(prev => prev.map(r => r.id === itemId ? {
+                ...r, 
+                ...analysis,
+                previewImage: assetPreview,
+                isRegenerating: false, 
+                tokensSpent: r.tokensSpent + TOKENS_PER_JOB, 
+                isEditing: false, 
+                originalState: undefined
+            } : r));
+            addToast('Analysis regenerated!', 'success');
+            if(user.tokens - TOKENS_PER_JOB < 50) addToast('Your token balance is getting low.', 'info');
+        } else {
+            addToast('Could not regenerate analysis for this item.', 'info');
+            setResults(prev => prev.map(r => r.id === itemId ? {...r, isRegenerating: false} : r));
+        }
     } catch (err) {
         await handleError(err);
         setResults(prev => prev.map(r => r.id === itemId ? {...r, isRegenerating: false} : r));
@@ -188,14 +204,6 @@ const AltTextGeneratorTool: React.FC = () => {
     setProcessingState(ProcessingState.DONE);
     setProgressMessage('');
   };
-  
-  const processAndAddItems = async (image: string, context: string | undefined, pageNum: number): Promise<ProcessedItem> => {
-      const item = await generateImageAnalysis(image, context);
-      decrementTokens(TOKENS_PER_JOB);
-      const newItem: ProcessedItem = { ...item, id: `${Date.now()}-${Math.random()}`, pageNumber: pageNum, previewImage: image, tokensSpent: TOKENS_PER_JOB };
-      setResults(prev => [...prev, newItem]);
-      return newItem;
-  };
 
   const handleUploads = useCallback(async (files: FileList | null, url: string | null) => {
     startProcessing();
@@ -207,40 +215,46 @@ const AltTextGeneratorTool: React.FC = () => {
             const docFile = fileArray.find(f => f.type === 'application/pdf' || f.name.endsWith('.docx'));
             const imageFiles = fileArray.filter(f => f.type.startsWith('image/'));
 
-            // Handle PDF or DOCX (only one is allowed)
             if (docFile) {
                 if (fileArray.length > 1) throw new Error("Please process either one document (PDF/DOCX) or multiple images at a time, but not both.");
-                const isPdf = docFile.type === 'application/pdf';
-                if (isPdf) {
-                    setProgressMessage('Parsing PDF pages...');
-                    const pageImages = await processPdfToImages(docFile);
-                    for (let i = 0; i < pageImages.length; i++) {
-                        if ((user?.tokens ?? 0) < TOKENS_PER_JOB) throw new Error('Processing stopped due to insufficient tokens.');
-                        setProgressMessage(`Analyzing page ${i + 1} of ${pageImages.length}...`);
-                        const pageImage = pageImages[i];
-                        const itemsFromPage = await generatePageAnalysis(pageImage);
-                        decrementTokens(TOKENS_PER_JOB); // One charge per page analysis
-                        for (const item of itemsFromPage) {
-                            const assetPreview = await cropImage(pageImage, item.boundingBox!);
-                            const newItem: ProcessedItem = { ...item, id: `${Date.now()}-${Math.random()}`, pageNumber: i + 1, previewImage: assetPreview, originalPageImage: pageImage, tokensSpent: TOKENS_PER_JOB };
-                            finalResults.push(newItem);
-                            setResults(prev => [...prev, newItem].sort((a, b) => a.pageNumber - b.pageNumber));
-                        }
-                    }
+                
+                let pageImages: string[] = [];
+                if (docFile.type === 'application/pdf') {
+                    setProgressMessage('Rendering PDF pages for analysis...');
+                    pageImages = await processPdfToImages(docFile);
                 } else { // DOCX
-                    setProgressMessage('Extracting elements from DOCX...');
-                    const docxElements = await processDocxToImages(docFile);
-                    if (docxElements.length === 0) addToast("No images or tables were found in the DOCX file.", "info");
-                    for (let i = 0; i < docxElements.length; i++) {
-                        if ((user?.tokens ?? 0) < TOKENS_PER_JOB) throw new Error('Processing stopped due to insufficient tokens.');
-                        setProgressMessage(`Analyzing element ${i + 1} of ${docxElements.length}...`);
-                        const element = docxElements[i];
-                        const newItem = await processAndAddItems(element.image, element.context, i + 1);
+                    setProgressMessage('Converting DOCX to images for analysis...');
+                    pageImages = await processDocxToImages(docFile);
+                }
+
+                if (pageImages.length === 0) {
+                     addToast('The document appears to be empty or could not be rendered.', 'info');
+                }
+
+                for (let i = 0; i < pageImages.length; i++) {
+                    if ((user?.tokens ?? 0) < TOKENS_PER_JOB) throw new Error('Processing stopped due to insufficient tokens.');
+                    setProgressMessage(`Analyzing page ${i + 1} of ${pageImages.length}...`);
+                    const pageImage = pageImages[i];
+                    const itemsFromPage = await generatePageAnalysis(pageImage);
+                    
+                    if (itemsFromPage.length > 0) decrementTokens(TOKENS_PER_JOB * itemsFromPage.length);
+
+                    for (const item of itemsFromPage) {
+                       if ((user?.tokens ?? 0) < 0) throw new Error('Processing stopped due to insufficient tokens.');
+                        const assetPreview = await cropImage(pageImage, item.boundingBox!);
+                        const newItem: ProcessedItem = { 
+                            ...item, 
+                            id: `${Date.now()}-${Math.random()}`, 
+                            pageNumber: i + 1, 
+                            previewImage: assetPreview, 
+                            originalPageImage: pageImage, 
+                            tokensSpent: TOKENS_PER_JOB 
+                        };
                         finalResults.push(newItem);
+                        setResults(prev => [...prev, newItem].sort((a, b) => a.pageNumber - b.pageNumber));
                     }
                 }
             } 
-            // Handle Images
             else if (imageFiles.length > 0) {
                 for (let i = 0; i < imageFiles.length; i++) {
                     if ((user?.tokens ?? 0) < TOKENS_PER_JOB) throw new Error('Processing stopped due to insufficient tokens.');
@@ -252,18 +266,45 @@ const AltTextGeneratorTool: React.FC = () => {
                         reader.onerror = reject;
                         reader.readAsDataURL(file);
                     });
-                    const newItem = await processAndAddItems(imageBase64, undefined, i + 1);
-                    finalResults.push(newItem);
+                    
+                    const items = await generatePageAnalysis(imageBase64);
+                    if (items.length > 0) {
+                        decrementTokens(TOKENS_PER_JOB);
+                        const assetPreview = items[0].boundingBox ? await cropImage(imageBase64, items[0].boundingBox) : imageBase64;
+                        const newItem: ProcessedItem = {
+                            ...items[0],
+                            id: `${Date.now()}-${Math.random()}`,
+                            pageNumber: i + 1,
+                            previewImage: assetPreview,
+                            originalPageImage: imageBase64,
+                            tokensSpent: TOKENS_PER_JOB
+                        };
+                        finalResults.push(newItem);
+                        setResults(prev => [...prev, newItem]);
+                    }
                 }
             }
         } 
-        // Handle URL
         else if (url) {
             if (!user || user.tokens < TOKENS_PER_JOB) throw new Error(`Insufficient tokens. You need ${TOKENS_PER_JOB} tokens.`);
             setProgressMessage('Fetching and analyzing image from URL...');
             const imageBase64 = await fetchImageAsBase64(url);
-            const newItem = await processAndAddItems(imageBase64, undefined, 1);
-            finalResults.push(newItem);
+            const items = await generatePageAnalysis(imageBase64);
+
+            if (items.length > 0) {
+                decrementTokens(TOKENS_PER_JOB);
+                const assetPreview = items[0].boundingBox ? await cropImage(imageBase64, items[0].boundingBox) : imageBase64;
+                const newItem: ProcessedItem = {
+                    ...items[0],
+                    id: `${Date.now()}-${Math.random()}`,
+                    pageNumber: 1,
+                    previewImage: assetPreview,
+                    originalPageImage: imageBase64,
+                    tokensSpent: TOKENS_PER_JOB
+                };
+                finalResults.push(newItem);
+                setResults(prev => [...prev, newItem]);
+            }
         }
     } catch (err) {
       await handleError(err);

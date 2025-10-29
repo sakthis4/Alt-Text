@@ -1,135 +1,126 @@
-// This assumes mammoth.js is loaded via a script tag in index.html
+// This assumes mammoth.js and html2canvas.js are loaded via script tags in index.html
 declare const mammoth: any;
-
-export interface DocxAsset {
-    image: string; // base64
-    context: string;
-}
+declare const html2canvas: any;
 
 /**
- * Renders an HTML element to a base64 encoded image using SVG foreignObject and Canvas.
+ * Renders HTML content into a series of paged images using the html2canvas library.
+ * This is a robust method to get a high-fidelity visual representation of the document.
+ * @param html The HTML content of the document's body.
+ * @param documentStyles The CSS styles extracted from the document.
+ * @returns A promise that resolves to an array of base64 encoded PNG images.
  */
-const renderElementToImage = (element: HTMLElement, width: number, height: number): Promise<string> => {
-    return new Promise((resolve, reject) => {
-        const elementHtml = element.outerHTML;
+const renderHtmlViaCanvas = (html: string, documentStyles: string): Promise<string[]> => {
+    return new Promise(async (resolve, reject) => {
+        const PAGE_WIDTH = 794; // A4-like width
+        const PAGE_HEIGHT = 1123; // A4-like height
+        const RENDER_SCALE = 2; // Render at 2x resolution for clarity
+
+        // 1. Create a hidden container and append it to the DOM
+        // html2canvas needs the element to be in the DOM to compute styles
+        const container = document.createElement('div');
+        container.style.position = 'absolute';
+        container.style.left = '-9999px'; // Position off-screen
+        container.style.width = `${PAGE_WIDTH}px`;
+        container.style.backgroundColor = 'white';
+        container.style.color = 'black';
+        
+        // Inject styles directly to ensure they are applied
         const style = `
             <style>
-                table { border-collapse: collapse; font-family: sans-serif; font-size: 14px; color: black; background-color: white; margin: 0; }
-                th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                p, div, span { color: black; }
+                body { margin: 0; font-family: sans-serif; }
+                ${documentStyles}
+                img { max-width: 100% !important; height: auto !important; }
+                table { border-collapse: collapse !important; width: 100% !important; page-break-inside: avoid; }
+                p, h1, h2, h3, h4, h5, h6, li, blockquote { page-break-inside: avoid; }
             </style>`;
-        const svg = `
-            <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-                <foreignObject width="100%" height="100%">
-                    <div xmlns="http://www.w3.org/1999/xhtml">
-                        ${style}
-                        ${elementHtml}
-                    </div>
-                </foreignObject>
-            </svg>`;
-        const svgUrl = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
-
-        const img = new Image();
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return reject(new Error('Could not create canvas context'));
-
-        img.onload = () => {
-            ctx.drawImage(img, 0, 0);
-            resolve(canvas.toDataURL('image/png'));
-        };
-        img.onerror = () => reject(new Error('Failed to render HTML element to image.'));
-        img.src = svgUrl;
-    });
-};
-
-/**
- * Extracts contextual text surrounding a given HTML element by checking its previous and next siblings.
- */
-const getContextFromSiblings = (element: HTMLElement): string => {
-    const contextParts: string[] = [];
-    let prev = element.previousElementSibling;
-    if (prev && prev.textContent) {
-        contextParts.push(`Previous paragraph: "${prev.textContent.trim()}"`);
-    }
-
-    let next = element.nextElementSibling;
-    if (next && next.textContent) {
-        contextParts.push(`Following paragraph: "${next.textContent.trim()}"`);
-    }
-
-    return contextParts.join('\n');
-};
-
-
-/**
- * Extracts visual assets (images, tables) from a .docx file and provides surrounding text as context.
- */
-export const processDocxToImages = async (file: File): Promise<DocxAsset[]> => {
-    const arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = e => e.target?.result instanceof ArrayBuffer ? resolve(e.target.result) : reject(new Error('Failed to read file.'));
-        reader.onerror = () => reject(reader.error || new Error('File reading error.'));
-        reader.readAsArrayBuffer(file);
-    });
-
-    try {
-        const htmlResult = await mammoth.convertToHtml({ arrayBuffer });
-        
-        const tempDiv = document.createElement('div');
-        tempDiv.style.position = 'absolute';
-        tempDiv.style.left = '-9999px';
-        tempDiv.style.top = '-9999px';
-        tempDiv.style.width = '800px'; 
-        tempDiv.innerHTML = htmlResult.value;
-        document.body.appendChild(tempDiv);
-        
-        const assets: DocxAsset[] = [];
-        // FIX: Add generic type to querySelectorAll to ensure assetElements are of type HTMLElement[], fixing a type error with getContextFromSiblings.
-        const assetElements = Array.from(tempDiv.querySelectorAll<HTMLElement>('img, table'));
-        const renderPromises: Promise<void>[] = [];
-
-        for (const element of assetElements) {
-            // Skip elements that are nested inside another asset (e.g., image in a table)
-            if (element.parentElement && assetElements.includes(element.parentElement)) {
-                continue;
-            }
-
-            const context = getContextFromSiblings(element);
             
-            if (element.tagName === 'IMG') {
-                const imgElement = element as HTMLImageElement;
-                // mammoth.js embeds images as base64 data URIs
-                if (imgElement.src.startsWith('data:')) {
-                    assets.push({ image: imgElement.src, context });
-                }
-            } else if (element.tagName === 'TABLE') {
-                const tableElement = element as HTMLTableElement;
-                const rect = tableElement.getBoundingClientRect();
+        container.innerHTML = style + html;
+        document.body.appendChild(container);
 
-                if (rect.width > 0 && rect.height > 0) {
-                    const promise = renderElementToImage(tableElement, rect.width, rect.height)
-                        .then(imageBase64 => {
-                            assets.push({ image: imageBase64, context });
-                        })
-                        .catch(err => {
-                             console.warn("Could not render a table from DOCX:", err);
-                        });
-                    renderPromises.push(promise);
-                }
+        try {
+            // 2. Use html2canvas to "screenshot" the entire container
+            const mainCanvas = await html2canvas(container, {
+                scale: RENDER_SCALE,
+                useCORS: true,
+                backgroundColor: '#ffffff',
+                logging: false,
+                allowTaint: true,
+            });
+
+            // 3. Paginate the resulting tall canvas into individual page images
+            const totalHeight = mainCanvas.height;
+            const numPages = Math.ceil(totalHeight / (PAGE_HEIGHT * RENDER_SCALE));
+            const pageImages: string[] = [];
+            
+            if(totalHeight === 0) {
+                resolve([]);
+                return;
             }
-        }
-        
-        await Promise.all(renderPromises);
-        
-        document.body.removeChild(tempDiv);
-        return assets;
 
+            for (let i = 0; i < numPages; i++) {
+                const pageCanvas = document.createElement('canvas');
+                pageCanvas.width = mainCanvas.width;
+                pageCanvas.height = PAGE_HEIGHT * RENDER_SCALE;
+                const ctx = pageCanvas.getContext('2d');
+                if (!ctx) continue;
+                
+                // Fill with white background in case of empty space at the end
+                ctx.fillStyle = 'white';
+                ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+                
+                const sx = 0;
+                const sy = i * PAGE_HEIGHT * RENDER_SCALE;
+                const sWidth = mainCanvas.width;
+                // Clamp the height to not read past the end of the source canvas
+                const sHeight = Math.min(PAGE_HEIGHT * RENDER_SCALE, totalHeight - sy);
+
+                if (sHeight > 0) {
+                    ctx.drawImage(mainCanvas, sx, sy, sWidth, sHeight, 0, 0, sWidth, sHeight);
+                }
+
+                pageImages.push(pageCanvas.toDataURL('image/png', 0.92));
+            }
+            resolve(pageImages);
+
+        } catch (error) {
+            console.error("html2canvas rendering failed:", error);
+            reject(new Error("Failed to render document content to an image."));
+        } finally {
+            // 4. Clean up by removing the hidden container from the DOM
+            document.body.removeChild(container);
+        }
+    });
+};
+
+
+/**
+ * Processes a DOCX file by converting it into a series of page-like images.
+ * This provides a high-fidelity visual representation for the AI to analyze,
+ * mirroring the robust process used for PDFs.
+ * @param file The DOCX file.
+ * @returns A promise that resolves to an array of base64 encoded page images.
+ */
+export const processDocxToImages = async (file: File): Promise<string[]> => {
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+        
+        const result = await mammoth.convertToHtml({ arrayBuffer });
+        
+        const html = result.value;
+        if (!html || html.trim() === '') {
+            return []; // Document is empty
+        }
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        
+        const styleBlocks = Array.from(doc.head.querySelectorAll('style'));
+        const documentStyles = styleBlocks.map(style => style.innerHTML).join('\n');
+        
+        return await renderHtmlViaCanvas(doc.body.innerHTML, documentStyles);
+        
     } catch (error) {
         console.error("Error processing DOCX file:", error);
-        throw new Error("Failed to extract elements from DOCX. The file may be corrupt, password-protected, or in an unsupported format.");
+        throw new Error("Failed to process DOCX. The file may be corrupt, password-protected, or in an unsupported format.");
     }
 };

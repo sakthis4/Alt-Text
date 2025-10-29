@@ -3,6 +3,7 @@ declare const pdfjsLib: any;
 
 /**
  * Processes a PDF file and converts each page into a base64 encoded JPEG image.
+ * This provides a high-quality visual representation for the AI to analyze.
  * @param file The PDF file to process.
  * @returns A promise that resolves to an array of base64 image strings.
  */
@@ -15,7 +16,6 @@ export const processPdfToImages = async (file: File): Promise<string[]> => {
 
     for (let i = 1; i <= numPages; i++) {
       const page = await pdf.getPage(i);
-      // Use a higher scale for better image quality to send to Gemini
       const scale = 2.5;
       const viewport = page.getViewport({ scale });
 
@@ -34,7 +34,6 @@ export const processPdfToImages = async (file: File): Promise<string[]> => {
       };
 
       await page.render(renderContext).promise;
-      // Use JPEG for smaller file size
       pageImages.push(canvas.toDataURL('image/jpeg', 0.92));
     }
 
