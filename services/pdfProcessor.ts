@@ -1,4 +1,3 @@
-
 // This assumes pdf.js is loaded via a script tag in index.html
 declare const pdfjsLib: any;
 
@@ -17,7 +16,7 @@ export const processPdfToImages = async (file: File): Promise<string[]> => {
     for (let i = 1; i <= numPages; i++) {
       const page = await pdf.getPage(i);
       // Use a higher scale for better image quality to send to Gemini
-      const scale = 2.0;
+      const scale = 2.5;
       const viewport = page.getViewport({ scale });
 
       const canvas = document.createElement('canvas');
@@ -36,12 +35,15 @@ export const processPdfToImages = async (file: File): Promise<string[]> => {
 
       await page.render(renderContext).promise;
       // Use JPEG for smaller file size
-      pageImages.push(canvas.toDataURL('image/jpeg', 0.9));
+      pageImages.push(canvas.toDataURL('image/jpeg', 0.92));
     }
 
     return pageImages;
   } catch (error) {
     console.error("Error processing PDF file:", error);
+    if (error && typeof error === 'object' && 'name' in error && error.name === 'PasswordException') {
+        throw new Error("Failed to process PDF: The file is password-protected.");
+    }
     throw new Error("Failed to process PDF. The file may be corrupt or an unsupported version.");
   }
 };

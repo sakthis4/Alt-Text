@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { IdentifiedItem } from '../types';
+import { IdentifiedItem, IdentifiedItemType } from '../types';
 
 if (!process.env.API_KEY) {
   throw new Error("API_KEY environment variable not set");
@@ -10,11 +10,11 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 const baseItemProperties = {
   type: {
     type: Type.STRING,
-    description: "The type of the element. Must be one of 'Image', 'Table', 'Equation', 'Map', 'Comics', or 'Other'.",
+    description: "The type of the element. Must be one of: 'Photograph', 'Illustration', 'Diagram', 'Table', 'Chart/Graph', 'Equation', 'Map', 'Comic', 'Scanned Document', or 'Other'.",
   },
   altText: {
     type: Type.STRING,
-    description: 'A concise and descriptive alternative text for the element.',
+    description: 'A concise, detailed, and descriptive alternative text for the element. If the image contains text (like a scanned document), include the full transcribed text. For equations, provide a semantic description.',
   },
   keywords: {
     type: Type.STRING,
@@ -23,6 +23,21 @@ const baseItemProperties = {
   taxonomy: {
     type: Type.STRING,
     description: 'A hierarchical category for the element, using ">" as a separator (e.g., "Science > Physics > Optics").'
+  },
+  confidence: {
+    type: Type.NUMBER,
+    description: 'A confidence score from 0.0 to 1.0 for the overall accuracy of the analysis.'
+  },
+  boundingBox: {
+    type: Type.OBJECT,
+    description: 'The bounding box of the identified element in pixels, relative to the top-left of the image. This is required for all elements.',
+    properties: {
+        x: { type: Type.NUMBER, description: 'The x-coordinate of the top-left corner.' },
+        y: { type: Type.NUMBER, description: 'The y-coordinate of the top-left corner.' },
+        width: { type: Type.NUMBER, description: 'The width of the element.' },
+        height: { type: Type.NUMBER, description: 'The height of the element.' }
+    },
+    required: ['x', 'y', 'width', 'height'],
   }
 };
 
@@ -31,38 +46,35 @@ const pageAnalysisResponseSchema = {
   items: {
     type: Type.OBJECT,
     properties: baseItemProperties,
-    required: ['type', 'altText', 'keywords', 'taxonomy'],
+    required: ['type', 'altText', 'keywords', 'taxonomy', 'confidence', 'boundingBox'],
   },
 };
 
 const singleImageAnalysisSchema = {
     type: Type.OBJECT,
     properties: {
-        ...baseItemProperties,
+      ...(({ boundingBox, ...rest }) => rest)(baseItemProperties),
     },
-    required: ['type', 'altText', 'keywords', 'taxonomy'],
+    required: ['type', 'altText', 'keywords', 'taxonomy', 'confidence'],
 };
 
 const commonPromptInstructions = `
 Key rules for the response:
-1. For 'altText', do NOT use generic lead-ins like "Image of" or "Figure showing". Describe the content directly.
-2. For mathematical/scientific notation, use standard Unicode characters where possible (e.g., "x²", "α", "∑"). Describe the overall purpose of complex equations.
-3. For 'keywords', provide a comma-separated list.
-4. For 'taxonomy', provide a hierarchical string using '>'.
-5. Respond ONLY with the JSON object/array matching the schema.`;
+1.  Perform OCR meticulously if the image contains any text.
+2.  For 'altText', describe the content directly without lead-ins like "Image of". For text-heavy images (e.g., 'Scanned Document'), the altText MUST include the full transcribed text.
+3.  For 'type', be specific. Use 'Photograph' for real-world photos, 'Illustration' for drawings/cartoons, 'Diagram' for technical drawings, 'Chart/Graph' for data visualizations.
+4.  For 'Equation' types, provide a descriptive 'altText' (e.g., "The quadratic formula for solving second-degree polynomial equations").
+5.  You MUST provide a pixel-based 'boundingBox' for every element identified on a larger page.
+6.  Provide a 'confidence' score between 0.0 and 1.0.
+7.  Respond ONLY with the JSON object/array matching the schema. Do not include markdown formatting like \`\`\`json.`;
 
 
 export const generatePageAnalysis = async (imageBase64: string): Promise<IdentifiedItem[]> => {
-  const prompt = `Analyze this document page. Identify all significant visual elements: images, tables, equations, maps, comics, and other diagrams. For each element, generate a comprehensive analysis including alt text, keywords, and taxonomy.
+  const prompt = `Analyze this document page. Identify ALL significant visual elements: photographs, illustrations, diagrams, tables (raster or native), charts, graphs, equations (MathML or image), maps, comics, and sections of scanned text. For each element, generate a comprehensive analysis.
 ${commonPromptInstructions}
-If no elements are found, return an empty array.`;
+If no distinct elements are found, treat the entire page as a single 'Scanned Document' element. If the page is truly blank, return an empty array.`;
 
-  const imagePart = {
-    inlineData: {
-      mimeType: 'image/jpeg',
-      data: imageBase64.split(',')[1],
-    },
-  };
+  const imagePart = { inlineData: { mimeType: 'image/jpeg', data: imageBase64.split(',')[1] } };
 
   try {
     const response = await ai.models.generateContent({
@@ -71,126 +83,116 @@ If no elements are found, return an empty array.`;
       config: {
         responseMimeType: "application/json",
         responseSchema: pageAnalysisResponseSchema,
-        temperature: 0.2,
+        temperature: 0.1,
       },
     });
 
-    const jsonString = response.text.trim();
+    const jsonString = (response.text || '').trim();
     if (!jsonString) return [];
     
-    let parsedJson;
-    try {
-        parsedJson = JSON.parse(jsonString);
-    } catch (parseError) {
-        console.error("Gemini API returned non-JSON response:", jsonString);
-        throw new Error("The AI model returned an invalid response. Please try again.");
-    }
-    
+    const parsedJson = JSON.parse(jsonString);
     if (Array.isArray(parsedJson)) {
-        return parsedJson.filter(item => item && item.type && item.altText) as IdentifiedItem[];
+        return parsedJson.filter(item => item && item.type && item.altText && item.boundingBox) as IdentifiedItem[];
     } else {
-        console.error("Gemini API response is not an array as expected:", parsedJson);
         throw new Error("The AI model returned data in an unexpected format.");
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error calling Gemini API for page analysis:", error);
-    if (error instanceof Error && (error.message.includes("invalid response") || error.message.includes("unexpected format"))) {
-        throw error;
+    if (error.message.includes('SAFETY')) {
+        throw new Error("Analysis failed: The content was blocked by the safety filter. Please try with a different file.");
     }
-    throw new Error("Failed to generate analysis. The Gemini API call failed. Check your API key and network connection.");
+    throw new Error(`Failed to generate page analysis. API Error: ${error.message}`);
   }
-};
-
-/**
- * Converts an image from a base64 string to a supported MIME type (PNG) if necessary.
- * @param imageBase64 The input image as a base64 data URL.
- * @returns A promise that resolves to a base64 data URL with a supported MIME type.
- */
-const convertToSupportedMimeType = async (imageBase64: string): Promise<string> => {
-    const mimeType = imageBase64.substring(imageBase64.indexOf(':') + 1, imageBase64.indexOf(';'));
-    // List of MIME types supported by Gemini Pro Vision
-    const supportedMimeTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif'];
-
-    if (supportedMimeTypes.includes(mimeType)) {
-        return imageBase64; // No conversion needed
-    }
-
-    // If not supported, convert to PNG
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-                return reject(new Error('Could not get canvas context for image conversion.'));
-            }
-            ctx.drawImage(img, 0, 0);
-            // Convert to PNG, which is widely supported.
-            resolve(canvas.toDataURL('image/png'));
-        };
-        img.onerror = (err) => {
-            console.error("Image conversion failed:", err);
-            reject(new Error(`Failed to load image with unsupported MIME type (${mimeType}) for conversion.`));
-        };
-        img.src = imageBase64;
-    });
 };
 
 
 export const generateImageAnalysis = async (imageBase64: string, context?: string): Promise<IdentifiedItem> => {
-    let prompt = `Generate a comprehensive analysis for this visual element, intended for a visually impaired user and for asset management. Provide its type, alt text, keywords, and taxonomy.`;
+    let prompt = `Generate a comprehensive analysis for this visual element.
+${commonPromptInstructions}`;
+    if (context) prompt += `\n\nUse this context from the document: "${context}"`;
 
-    if (context) {
-        prompt += `\n\nUse the following text from the document for context when generating the analysis:\n---\n${context}\n---`;
-    }
-    
-    prompt += `\n${commonPromptInstructions}`;
-
+    const mimeType = imageBase64.substring(imageBase64.indexOf(':') + 1, imageBase64.indexOf(';'));
+    const data = imageBase64.split(',')[1];
+    const imagePart = { inlineData: { mimeType, data } };
 
     try {
-        const supportedImageBase64 = await convertToSupportedMimeType(imageBase64);
-        
-        const mimeType = supportedImageBase64.substring(supportedImageBase64.indexOf(':') + 1, supportedImageBase64.indexOf(';'));
-        const data = supportedImageBase64.split(',')[1];
-
-        const imagePart = { inlineData: { mimeType, data } };
-
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-pro',
             contents: { parts: [imagePart, { text: prompt }] },
             config: {
                 responseMimeType: "application/json",
                 responseSchema: singleImageAnalysisSchema,
-                temperature: 0.2,
+                temperature: 0.1,
             },
         });
 
-        const jsonString = response.text.trim();
-        if (!jsonString) {
-            throw new Error("The AI model returned an empty response.");
-        }
+        const jsonString = (response.text || '').trim();
+        if (!jsonString) throw new Error("The AI model returned an empty response.");
 
-        let parsedJson;
-        try {
-            parsedJson = JSON.parse(jsonString);
-        } catch (parseError) {
-            console.error("Gemini API returned non-JSON response:", jsonString);
-            throw new Error("The AI model returned an invalid response. Please try again.");
-        }
-
+        const parsedJson = JSON.parse(jsonString);
         if (parsedJson && parsedJson.type && parsedJson.altText) {
             return parsedJson as IdentifiedItem;
         } else {
-            console.error("Invalid response structure from Gemini API:", parsedJson);
             throw new Error("The AI model returned data in an unexpected format.");
         }
-    } catch (error) {
-        console.error("Error calling Gemini API for a single image:", error);
-        if (error instanceof Error && (error.message.includes("invalid response") || error.message.includes("unexpected format") || error.message.includes("empty response") || error.message.includes("conversion"))) {
-            throw error;
+    } catch (error: any) {
+        console.error("Error calling Gemini API for single image:", error);
+        if (error.message.includes('SAFETY')) {
+            throw new Error("Analysis failed: The image was blocked by the safety filter.");
         }
-        throw new Error("Failed to generate analysis for the image. The Gemini API call may have failed.");
+        throw new Error(`Failed to generate image analysis. API Error: ${error.message}`);
+    }
+};
+
+export const generateSummary = async (identifiedItems: IdentifiedItem[]): Promise<string> => {
+    if (identifiedItems.length === 0) return "No visual elements were identified in the document.";
+    
+    const itemCounts = identifiedItems.reduce((acc, item) => {
+        acc[item.type] = (acc[item.type] || 0) + 1;
+        return acc;
+    }, {} as Record<IdentifiedItemType, number>);
+
+    const summaryList = Object.entries(itemCounts)
+        .map(([type, count]) => `${count} ${type}${count > 1 ? 's' : ''}`)
+        .join(', ');
+
+    const prompt = `Based on the following list of identified visual assets from a document, write a brief, one-paragraph summary of the document's visual content.
+    
+    Assets found: ${summaryList}.
+    
+    Example: "The document appears to be a technical report, containing 3 Tables, 2 Charts/Graphs, and 1 Diagram to visualize data and concepts."`;
+    
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+        });
+        return response.text || '';
+    } catch (error) {
+        console.error("Error generating summary:", error);
+        return `The document contains the following assets: ${summaryList}.`; // Fallback summary
+    }
+}
+
+
+export const explainError = async (errorMessage: string): Promise<string> => {
+    const prompt = `An error occurred in a web application. Explain this error to a non-technical user in a clear, friendly, and simple way. Provide a likely cause and one or two actionable suggestions. Keep the explanation to 1-2 sentences.
+
+    Error Message: "${errorMessage}"
+
+    Example format:
+    Explanation: [Friendly explanation].
+    Suggestion: [Actionable suggestion].
+    `;
+    
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+        });
+        return (response.text || errorMessage).replace("Explanation: ", "").replace("Suggestion: ", "\nSuggestion: ");
+    } catch (error) {
+        console.error("Error explaining error:", error);
+        return errorMessage; // Fallback to original error message
     }
 };
